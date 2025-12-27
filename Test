@@ -1,5 +1,4 @@
 /*
- * Next-Gen Maritime Transportation System (MTS) communication simulation in ns-3
  *
  * What this “conversion” does vs your original code:
  * - users        -> vessels (mobile)
