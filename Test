@@ -1,0 +1,196 @@
+/*
+ * Next-Gen Maritime Transportation System (MTS) communication simulation in ns-3
+ *
+ * What this “conversion” does vs your original code:
+ * - users        -> vessels (mobile)
+ * - server       -> onshore control station (fixed)
+ * - peer         -> offshore platform (fixed)
+ * - drone        -> HAP relay node (high-altitude platform; modeled as a relay/router)
+ *
+ * Links (kept simple but MTS-flavored):
+ * - Onshore <-> Offshore Platform: Point-to-Point (subsea optical fiber backbone)
+ * - Offshore Platform <-> HAP:     Point-to-Point (FSO backhaul abstraction)
+ * - HAP <-> Vessels:               WiFi (RF access link; vessel mobility)
+ *
+ * Apps:
+ * - Onshore runs UDP Echo Server
+ * - Each vessel runs UDP Echo Client to the onshore station
+ *
+ * Notes:
+ * - This is a *system-level* MTS communication simulation (latency/throughput/mobility),
+ *   not a photon-level QKD optical simulation.
+ */
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/wifi-module.h"
+#include "ns3/yans-wifi-helper.h"
+#include "ns3/ipv4-global-routing-helper.h"
+
+using namespace ns3;
+
+int
+main (int argc, char *argv[])
+{
+  Time::SetResolution (Time::NS);
+
+  // ---- Parameters (easy to tweak for experiments) ----
+  uint32_t nVessels = 20;
+  double simTimeS = 30.0;
+
+  // Fiber (Platform <-> Onshore)
+  std::string fiberRate = "5Gbps";
+  std::string fiberDelay = "8ms"; // subsea fiber-ish latency
+
+  // FSO abstraction (Platform <-> HAP)
+  std::string fsoRate = "2Gbps";
+  std::string fsoDelay = "4ms";
+
+  // WiFi (HAP <-> Vessels) as RF access
+  std::string wifiDataMode = "OfdmRate54Mbps"; // simple choice
+
+  CommandLine cmd;
+  cmd.AddValue ("nVessels", "Number of vessels", nVessels);
+  cmd.AddValue ("simTimeS", "Simulation time (seconds)", simTimeS);
+  cmd.Parse (argc, argv);
+
+  // ---- Nodes ----
+  NodeContainer vessels;
+  vessels.Create (nVessels);
+
+  Ptr<Node> onshore = CreateObject<Node> ();   // Control Station
+  Ptr<Node> platform = CreateObject<Node> ();  // Offshore Platform
+  Ptr<Node> hap = CreateObject<Node> ();       // HAP relay
+
+  // ---- Internet stack ----
+  InternetStackHelper stack;
+  stack.Install (vessels);
+  stack.Install (onshore);
+  stack.Install (platform);
+  stack.Install (hap);
+
+  // ---- Mobility ----
+  // Onshore/platform/HAP: fixed positions (conceptual)
+  MobilityHelper fixedMob;
+  fixedMob.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+  fixedMob.Install (onshore);
+  fixedMob.Install (platform);
+  fixedMob.Install (hap);
+
+  // Set positions for fixed nodes (x,y,z)
+  {
+    Ptr<MobilityModel> mOnshore = onshore->GetObject<MobilityModel> ();
+    Ptr<MobilityModel> mPlat = platform->GetObject<MobilityModel> ();
+    Ptr<MobilityModel> mHap = hap->GetObject<MobilityModel> ();
+
+    mOnshore->SetPosition (Vector (0.0, 0.0, 0.0));          // Coast
+    mPlat->SetPosition (Vector (100000.0, 0.0, 0.0));        // 100 km offshore
+    mHap->SetPosition (Vector (100000.0, 0.0, 20000.0));     // 20 km altitude above platform
+  }
+
+  // Vessels: moving on sea surface near the platform
+  MobilityHelper vesselMob;
+  vesselMob.SetPositionAllocator ("ns3::RandomRectanglePositionAllocator",
+                                  "X", StringValue ("ns3::UniformRandomVariable[Min=90000.0|Max=110000.0]"),
+                                  "Y", StringValue ("ns3::UniformRandomVariable[Min=-20000.0|Max=20000.0]"));
+  // RandomWaypoint gives realistic movement; tune Speed/Pause for different sea states
+  vesselMob.SetMobilityModel ("ns3::RandomWaypointMobilityModel",
+                              "Speed", StringValue ("ns3::UniformRandomVariable[Min=2.0|Max=8.0]"),  // m/s
+                              "Pause", StringValue ("ns3::ConstantRandomVariable[Constant=2.0]"),
+                              "PositionAllocator", PointerValue (vesselMob.GetPositionAllocator ()));
+  vesselMob.Install (vessels);
+
+  // ---- Link 1: Onshore <-> Platform (Subsea Optical Fiber) ----
+  PointToPointHelper p2pFiber;
+  p2pFiber.SetDeviceAttribute ("DataRate", StringValue (fiberRate));
+  p2pFiber.SetChannelAttribute ("Delay", StringValue (fiberDelay));
+
+  NetDeviceContainer devOnshorePlat = p2pFiber.Install (NodeContainer (onshore, platform));
+
+  // ---- Link 2: Platform <-> HAP (FSO backhaul abstraction) ----
+  PointToPointHelper p2pFso;
+  p2pFso.SetDeviceAttribute ("DataRate", StringValue (fsoRate));
+  p2pFso.SetChannelAttribute ("Delay", StringValue (fsoDelay));
+
+  NetDeviceContainer devPlatHap = p2pFso.Install (NodeContainer (platform, hap));
+
+  // ---- Link 3: HAP <-> Vessels (RF access via WiFi) ----
+  // Treat HAP as AP and vessels as STAs
+  WifiHelper wifi;
+  wifi.SetStandard (WIFI_STANDARD_80211a);
+  wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager",
+                                "DataMode", StringValue (wifiDataMode),
+                                "ControlMode", StringValue (wifiDataMode));
+
+  YansWifiChannelHelper wifiChannel = YansWifiChannelHelper::Default ();
+  YansWifiPhyHelper wifiPhy;
+  wifiPhy.SetChannel (wifiChannel.Create ());
+
+  WifiMacHelper wifiMac;
+  Ssid ssid = Ssid ("mts-hap-access");
+
+  // STAs (vessels)
+  wifiMac.SetType ("ns3::StaWifiMac",
+                   "Ssid", SsidValue (ssid),
+                   "ActiveProbing", BooleanValue (false));
+  NetDeviceContainer staDevs = wifi.Install (wifiPhy, wifiMac, vessels);
+
+  // AP (HAP)
+  wifiMac.SetType ("ns3::ApWifiMac",
+                   "Ssid", SsidValue (ssid));
+  NetDeviceContainer apDevs = wifi.Install (wifiPhy, wifiMac, hap);
+
+  // ---- IP addressing ----
+  Ipv4AddressHelper addr;
+
+  // Subnet A: Onshore <-> Platform (fiber)
+  addr.SetBase ("10.10.0.0", "255.255.255.0");
+  Ipv4InterfaceContainer ifOnshorePlat = addr.Assign (devOnshorePlat);
+
+  // Subnet B: Platform <-> HAP (FSO)
+  addr.SetBase ("10.20.0.0", "255.255.255.0");
+  Ipv4InterfaceContainer ifPlatHap = addr.Assign (devPlatHap);
+
+  // Subnet C: HAP <-> Vessels (WiFi)
+  addr.SetBase ("10.30.0.0", "255.255.255.0");
+  Ipv4InterfaceContainer ifSta = addr.Assign (staDevs);
+  Ipv4InterfaceContainer ifAp = addr.Assign (apDevs);
+
+  // ---- Routing ----
+  Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
+
+  // ---- Applications ----
+  // Onshore: UDP echo server (represents control service endpoint)
+  uint16_t port = 9;
+  UdpEchoServerHelper echoServer (port);
+  ApplicationContainer serverApps = echoServer.Install (onshore);
+  serverApps.Start (Seconds (1.0));
+  serverApps.Stop (Seconds (simTimeS));
+
+  // Vessels: UDP echo clients sending to onshore control station
+  // Destination IP = Onshore interface on fiber subnet
+  Ipv4Address onshoreAddr = ifOnshorePlat.GetAddress (0);
+
+  for (uint32_t i = 0; i < vessels.GetN (); ++i)
+    {
+      UdpEchoClientHelper echoClient (onshoreAddr, port);
+      echoClient.SetAttribute ("MaxPackets", UintegerValue (5));
+      echoClient.SetAttribute ("Interval", TimeValue (Seconds (2.0)));
+      echoClient.SetAttribute ("PacketSize", UintegerValue (512));
+
+      ApplicationContainer clientApps = echoClient.Install (vessels.Get (i));
+      // Stagger start times
+      clientApps.Start (Seconds (2.0 + i * 0.2));
+      clientApps.Stop (Seconds (simTimeS));
+    }
+
+  // ---- Run ----
+  Simulator::Stop (Seconds (simTimeS));
+  Simulator::Run ();
+  Simulator::Destroy ();
+  return 0;
+}
